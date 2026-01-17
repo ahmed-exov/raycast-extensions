@@ -1,6 +1,5 @@
 import {
   AI,
-  Clipboard,
   getPreferenceValues,
   launchCommand,
   LaunchType,
@@ -10,7 +9,9 @@ import {
 } from "@raycast/api";
 
 import { execSync } from "child_process";
-import { platform } from "os";
+import { writeFileSync, unlinkSync } from "fs";
+import { tmpdir } from "os";
+import { join } from "path";
 
 interface ActionConfig {
   title: string;
@@ -106,87 +107,40 @@ async function runStealthActionInternal(
   }
   console.log(`Config: ${currentConfig.title}`);
 
-  const isMac = platform() === "darwin";
-
-  // 2. Get selected text
+  // 2. Get selected text - with detailed logging
   let selectedText = "";
   let hasRealSelection = false;
 
-  // Store original app info for re-activation (macOS only)
+  // Get frontmost app (both name and bundle ID for reliable re-activation)
   let frontApp = "";
   let frontAppBundleId = "";
-
-  if (isMac) {
-    // macOS: Get the PREVIOUS frontmost app (not Raycast)
+  try {
+    frontApp = execSync(
+      `osascript -e 'tell application "System Events" to get name of first process whose frontmost is true'`,
+    )
+      .toString()
+      .trim();
+    console.log(`[DEBUG] Frontmost app: ${frontApp}`);
+    
+    // Also get bundle ID for more reliable activation later
     try {
-      const previousAppResult = execSync(
-        `osascript -e '
-          tell application "System Events"
-            set frontProc to first process whose frontmost is true
-            set frontName to name of frontProc
-            if frontName is "Raycast" then
-              set allProcs to every process whose visible is true and name is not "Raycast"
-              if (count of allProcs) > 0 then
-                set targetProc to item 1 of allProcs
-                return {name of targetProc, bundle identifier of targetProc}
-              else
-                return {"", ""}
-              end if
-            else
-              return {frontName, bundle identifier of frontProc}
-            end if
-          end tell
-        '`,
+      frontAppBundleId = execSync(
+        `osascript -e 'tell application "System Events" to get bundle identifier of first process whose frontmost is true'`,
       )
         .toString()
         .trim();
-
-      console.log(`[DEBUG] Previous app result: ${previousAppResult}`);
-
-      const match = previousAppResult.match(/^(.+?),\s*(.+)$/);
-      if (match) {
-        frontApp = match[1].trim();
-        frontAppBundleId = match[2].trim();
-      } else {
-        frontApp = previousAppResult;
-      }
-
-      console.log(`[DEBUG] Target app: ${frontApp} (${frontAppBundleId})`);
-
-      if (!frontApp || frontApp === "Raycast" || frontApp === "") {
-        const fallbackResult = execSync(
-          `osascript -e '
-            tell application "System Events"
-              set procList to name of every process whose visible is true and name is not "Raycast" and name is not "Finder"
-              if (count of procList) > 0 then
-                return item 1 of procList
-              else
-                return "Finder"
-              end if
-            end tell
-          '`,
-        )
-          .toString()
-          .trim();
-        frontApp = fallbackResult;
-        console.log(`[DEBUG] Fallback app: ${frontApp}`);
-      }
+      console.log(`[DEBUG] Frontmost app bundle ID: ${frontAppBundleId}`);
     } catch (e) {
-      console.log(`[DEBUG] Could not get frontmost app: ${e}`);
+      console.log("[DEBUG] Could not get bundle ID, will use app name");
     }
-
-    if (frontApp === "Raycast") {
-      frontApp = "";
-      frontAppBundleId = "";
-    }
+  } catch (e) {
+    console.log("[DEBUG] Could not get frontmost app");
   }
 
-  // Use Raycast's cross-platform Clipboard API to read selected text
-  // First, clear clipboard with a marker to detect if copy happens
+  // Clear clipboard with a marker to detect if copy happens
   const marker = `__NO_SELECTION_${Date.now()}__`;
-
   try {
-    await Clipboard.copy(marker);
+    execSync(`printf '%s' "${marker}" | pbcopy`);
     console.log("[DEBUG] Clipboard cleared with marker");
   } catch (e) {
     console.log("[DEBUG] Could not clear clipboard");
@@ -194,29 +148,22 @@ async function runStealthActionInternal(
 
   try {
     if (!forceEditor) {
-      // Simulate Cmd+C / Ctrl+C to copy selection
-      console.log("[DEBUG] Sending copy command...");
-
-      if (isMac) {
-        execSync(
-          `osascript -e 'tell application "System Events" to key code 8 using command down'`,
-        );
-      } else {
-        // Windows: Use PowerShell to send Ctrl+C
-        execSync(
-          `powershell -Command "Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.SendKeys]::SendWait('^c')"`,
-        );
-      }
+      // First, try to copy current selection using Cmd+C via key code (more reliable)
+      console.log("[DEBUG] Sending Cmd+C to copy selection...");
+      // Using key code 8 (C) instead of keystroke for better reliability
+      execSync(
+        `osascript -e 'tell application "System Events" to key code 8 using command down'`,
+      );
 
       // Wait for clipboard to update
       await new Promise((resolve) => setTimeout(resolve, 250));
 
-      // Check what's in clipboard now using Raycast API
+      // Check what's in clipboard now
       let clipboardAfter = "";
       try {
-        clipboardAfter = (await Clipboard.readText()) || "";
+        clipboardAfter = execSync("pbpaste").toString();
         console.log(
-          `[DEBUG] Clipboard after copy: "${clipboardAfter.substring(0, 50)}" (${clipboardAfter.length} chars)`,
+          `[DEBUG] Clipboard after Cmd+C: "${clipboardAfter.substring(0, 50)}" (${clipboardAfter.length} chars)`,
         );
 
         if (clipboardAfter === marker) {
@@ -224,27 +171,22 @@ async function runStealthActionInternal(
             "[DEBUG] Clipboard still has marker - NO SELECTION, auto-selecting line...",
           );
 
-          if (isMac) {
-            // macOS: Auto-select current line
-            execSync(
-              `osascript -e 'tell application "System Events"
-                key code 124 using command down
-                delay 0.05
-                key code 123 using {command down, shift down}
-                delay 0.05
-                key code 8 using command down
-              end tell'`,
-            );
-          } else {
-            // Windows: Home, then Shift+End to select line, then Ctrl+C
-            execSync(
-              `powershell -Command "Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.SendKeys]::SendWait('{END}'); Start-Sleep -Milliseconds 50; [System.Windows.Forms.SendKeys]::SendWait('+{HOME}'); Start-Sleep -Milliseconds 50; [System.Windows.Forms.SendKeys]::SendWait('^c')"`,
-            );
-          }
+          // Auto-select current line: Cmd+Right (end) then Cmd+Shift+Left (select to start)
+          execSync(
+            `osascript -e 'tell application "System Events"
+              key code 124 using command down
+              delay 0.05
+              key code 123 using {command down, shift down}
+              delay 0.05
+              keystroke "c" using command down
+            end tell'`,
+          );
 
+          // Wait for clipboard
           await new Promise((resolve) => setTimeout(resolve, 200));
 
-          clipboardAfter = (await Clipboard.readText()) || "";
+          // Check clipboard again
+          clipboardAfter = execSync("pbpaste").toString();
           console.log(
             `[DEBUG] Clipboard after auto-select: "${clipboardAfter.substring(0, 50)}" (${clipboardAfter.length} chars)`,
           );
@@ -312,69 +254,64 @@ async function runStealthActionInternal(
 
     const cleanResult = result.trim();
 
-    // 5. Insert text using Raycast's cross-platform Clipboard.paste API
+    // 5. Insert text using AppleScript keystroke (no clipboard)
     toast.title = "Inserting...";
-    console.log(`Pasting ${cleanResult.length} chars to replace selection`);
+    console.log(`Typing ${cleanResult.length} chars to replace selection`);
 
-    // Re-activate the original app before pasting (macOS only)
-    if (isMac) {
-      if (frontAppBundleId && frontAppBundleId !== "com.apple.finder") {
+    // Write result to temp file (to handle special characters safely)
+    const tempFile = join(tmpdir(), `raycast-ai-${Date.now()}.txt`);
+    writeFileSync(tempFile, cleanResult, "utf8");
+
+    try {
+      // Use clipboard + Cmd+V paste - this is modifier-safe because we explicitly specify the modifier
+      // First, copy result to clipboard (escape path for shell safety)
+      const escapedPath = tempFile.replace(/'/g, "'\\''");
+      execSync(`cat '${escapedPath}' | pbcopy`);
+
+      // Re-activate the original app before pasting to ensure focus
+      // This prevents paste going to wrong app (like Finder) if focus was lost during AI call
+      if (frontAppBundleId) {
         try {
           execSync(
             `osascript -e 'tell application id "${frontAppBundleId}" to activate'`,
             { timeout: 5000 },
           );
-          await new Promise((resolve) => setTimeout(resolve, 150));
-          console.log(
-            `[DEBUG] Re-activated app by bundle ID: ${frontAppBundleId}`,
-          );
+          // Small delay to ensure app is fully focused
+          await new Promise((resolve) => setTimeout(resolve, 100));
+          console.log(`[DEBUG] Re-activated app by bundle ID: ${frontAppBundleId}`);
         } catch (e) {
-          console.log(`[DEBUG] Could not activate by bundle ID: ${e}`);
-          if (frontApp && frontApp !== "Finder") {
-            try {
-              const escapedAppName = frontApp.replace(/"/g, '\\"');
-              execSync(
-                `osascript -e 'tell application "${escapedAppName}" to activate'`,
-                { timeout: 5000 },
-              );
-              await new Promise((resolve) => setTimeout(resolve, 150));
-              console.log(`[DEBUG] Re-activated app by name: ${frontApp}`);
-            } catch (e2) {
-              console.log(
-                `[DEBUG] Could not re-activate by name either: ${e2}`,
-              );
-            }
-          }
+          console.log(`[DEBUG] Could not activate by bundle ID, trying name`);
         }
-      } else if (frontApp && frontApp !== "Finder") {
+      } else if (frontApp) {
         try {
+          // Escape app name for AppleScript
           const escapedAppName = frontApp.replace(/"/g, '\\"');
           execSync(
             `osascript -e 'tell application "${escapedAppName}" to activate'`,
             { timeout: 5000 },
           );
-          await new Promise((resolve) => setTimeout(resolve, 150));
+          await new Promise((resolve) => setTimeout(resolve, 100));
           console.log(`[DEBUG] Re-activated app by name: ${frontApp}`);
         } catch (e) {
           console.log(`[DEBUG] Could not re-activate original app: ${e}`);
         }
-      } else {
-        // No valid app to re-activate - use clipboard only mode
-        console.log(
-          "[DEBUG] No valid app to re-activate, using clipboard only",
-        );
-        await Clipboard.copy(cleanResult);
-        toast.style = Toast.Style.Success;
-        toast.title = "Copied to clipboard";
-        toast.message = "Press Cmd+V to paste";
-        return;
+      }
+
+      // Paste using key code 9 (V) with explicit command modifier
+      // This won't combine with other held modifiers because we're using key code
+      execSync(
+        `osascript -e 'tell application "System Events" to key code 9 using command down'`,
+        { timeout: 60000 },
+      );
+      console.log("Text inserted successfully");
+    } finally {
+      // Clean up temp file
+      try {
+        unlinkSync(tempFile);
+      } catch (e) {
+        // Ignore cleanup errors
       }
     }
-
-    // Use Raycast's cross-platform paste API
-    // This handles clipboard + paste in one call and works on both macOS and Windows
-    await Clipboard.paste(cleanResult);
-    console.log("Text inserted successfully");
 
     toast.style = Toast.Style.Success;
     toast.title = "Done!";
